@@ -1,5 +1,4 @@
 import { pgTable, serial, text, integer, timestamp, boolean, jsonb, uniqueIndex } from "drizzle-orm/pg-core";
-import type { QuizLayout } from "../lib/quiz";
 
 export const students = pgTable("unit3_students", {
   id: serial("id").primaryKey(),
@@ -9,14 +8,6 @@ export const students = pgTable("unit3_students", {
   createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
 }, (t) => [uniqueIndex("unit3_student_identity").on(t.name, t.classroom)]);
 
-export const authSessions = pgTable("unit3_sessions", {
-  tokenHash: text("token_hash").primaryKey(),
-  role: text("role").notNull(),
-  studentId: integer("student_id").references(() => students.id),
-  expiresAt: timestamp("expires_at", { withTimezone: true }).notNull(),
-  createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
-});
-
 export const attempts = pgTable("unit3_attempts", {
   id: serial("id").primaryKey(),
   studentId: integer("student_id").notNull().references(() => students.id),
@@ -24,7 +15,6 @@ export const attempts = pgTable("unit3_attempts", {
   finishedAt: timestamp("finished_at", { withTimezone: true }),
   score: integer("score").default(0).notNull(),
   status: text("status").default("in_progress").notNull(),
-  layout: jsonb("layout").$type<QuizLayout>(),
 });
 
 export const answers = pgTable("unit3_answers", {

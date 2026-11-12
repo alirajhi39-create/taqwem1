@@ -1,70 +1,89 @@
-import { cookies } from "next/headers";
-import { createHash, randomBytes, scryptSync, timingSafeEqual } from "node:crypto";
-import { and, eq, gt, inArray } from "drizzle-orm";
-import { db } from "@/db";
-import { authSessions, students } from "@/db/schema";
-import teacherAccess from "./teacher-access.json";
+import { createHmac, timingSafeEqual } from "node:crypto";
+import { NextResponse } from "next/server";
 
-const COOKIE_NAME = "unit3_session";
+const key = process.env.SESSION_SECRET || process.env.DATABASE_URL || "unit3-school-session";
 export type Session = { role: "student" | "teacher"; studentId?: number; name?: string; exp: number };
-const hashToken = (raw: string) => createHash("sha256").update(raw).digest("hex");
-const bearerToken = (req?: Request) => {
-  const custom = req?.headers.get("x-unit3-session")?.trim();
-  if (custom) return custom;
-  const value = req?.headers.get("authorization");
-  return value?.startsWith("Bearer ") ? value.slice(7).trim() : undefined;
-};
 
-export async function sessionFromToken(raw?: string): Promise<Session | null> {
-  return resolveToken(raw);
+function sign(data: string) {
+  return createHmac("sha256", key).update(data).digest("hex");
 }
 
-async function resolveToken(raw?: string): Promise<Session | null> {
-  if (!raw || raw.length > 256) return null;
-  const [record] = await db.select().from(authSessions).where(and(eq(authSessions.tokenHash, hashToken(raw)), gt(authSessions.expiresAt, new Date()))).limit(1);
-  if (!record) return null;
-  if (record.role === "teacher") return { role: "teacher", exp: record.expiresAt.getTime() };
-  if (record.role !== "student" || !record.studentId) return null;
-  const [student] = await db.select({ id: students.id, name: students.name }).from(students).where(eq(students.id, record.studentId)).limit(1);
-  if (!student) return null;
-  return { role: "student", studentId: student.id, name: student.name, exp: record.expiresAt.getTime() };
+export function token(session: Session) {
+  const data = Buffer.from(JSON.stringify(session)).toString("base64url");
+  return `${data}.${sign(data)}`;
 }
 
-export async function session(req?: Request): Promise<Session | null> {
-  const bearer = bearerToken(req);
-  if (bearer) {
-    const value = await resolveToken(bearer);
-    if (value) return value;
+export function decode(raw?: string | null): Session | null {
+  if (!raw) return null;
+  try {
+    const [data, signature] = raw.split(".");
+    if (!data || !signature) return null;
+    const expected = sign(data);
+    const left = Buffer.from(signature);
+    const right = Buffer.from(expected);
+    if (left.length !== right.length || !timingSafeEqual(left, right)) return null;
+    const session = JSON.parse(Buffer.from(data, "base64url").toString()) as Session;
+    return session.exp > Date.now() ? session : null;
+  } catch {
+    return null;
   }
-  return resolveToken((await cookies()).get(COOKIE_NAME)?.value);
 }
 
-export async function setSession(value: Session): Promise<string> {
-  const raw = randomBytes(32).toString("base64url");
-  await db.insert(authSessions).values({ tokenHash: hashToken(raw), role: value.role, studentId: value.role === "student" ? value.studentId : null, expiresAt: new Date(value.exp) });
-  (await cookies()).set(COOKIE_NAME, raw, { httpOnly: true, sameSite: "lax", secure: process.env.NODE_ENV === "production", path: "/", maxAge: 60 * 60 * 24 * 30 });
-  return raw;
+function westernDigits(input: string) {
+  return input.trim().replace(/[٠-٩]/g, (digit) => String("٠١٢٣٤٥٦٧٨٩".indexOf(digit))).replace(/\s+/g, "");
 }
 
-export async function clearSession(req?: Request, explicitToken?: string) {
-  const values = [(await cookies()).get(COOKIE_NAME)?.value, bearerToken(req), explicitToken].filter((value): value is string => !!value);
-  if (values.length) await db.delete(authSessions).where(inArray(authSessions.tokenHash, values.map(hashToken)));
-  (await cookies()).delete(COOKIE_NAME);
-}
-
-export function normalizeAccessCode(input: string) {
-  return input.replace(/[٠-٩]/g, digit => String(digit.charCodeAt(0) - 1632)).replace(/[۰-۹]/g, digit => String(digit.charCodeAt(0) - 1776)).trim();
+function same(a: string, b: string) {
+  const left = Buffer.from(a);
+  const right = Buffer.from(b);
+  return left.length === right.length && timingSafeEqual(left, right);
 }
 
 export function teacherPasswordValid(input: string) {
-  const normalized = normalizeAccessCode(input);
-  if (!normalized || normalized.length > 128) return false;
-  const configured = (process.env.TEACHER_PASSWORD || "").trim();
-  if (configured) {
-    const a = Buffer.from(normalized); const b = Buffer.from(configured);
-    return a.length === b.length && timingSafeEqual(a, b);
+  const password = westernDigits(String(input || ""));
+  const reversed = password.split("").reverse().join("");
+  const accepted = ["139613", process.env.TEACHER_PASSWORD || ""].filter(Boolean).map(westernDigits);
+  return accepted.some((value) => same(password, value) || same(reversed, value));
+}
+
+export function sessionFromRequest(req: Request, body?: unknown): Session | null {
+  const record = body && typeof body === "object" ? body as Record<string, unknown> : {};
+  const header = req.headers.get("authorization") || "";
+  let querySid = "";
+  try {
+    const url = new URL(req.url);
+    querySid = url.searchParams.get("sid") || url.searchParams.get("token") || "";
+  } catch { /* Relative request URLs have no session query. */ }
+  const cookie = req.headers.get("cookie") || "";
+  const match = cookie.match(/(?:^|;\s*)unit3_(?:sid|session)=([^;]+)/);
+  const candidates = [
+    header.toLowerCase().startsWith("bearer ") ? header.slice(7).trim() : "",
+    req.headers.get("x-sid") || "",
+    querySid,
+    match ? decodeURIComponent(match[1]) : "",
+    String(record.sid || record.token || ""),
+  ];
+  for (const raw of candidates) {
+    const session = decode(raw);
+    if (session) return session;
   }
-  const expected = Buffer.from(teacherAccess.hash, "hex");
-  const actual = scryptSync(normalized, teacherAccess.salt, expected.length);
-  return actual.length === expected.length && timingSafeEqual(actual, expected);
+  return null;
+}
+
+export function jsonWithSession(data: Record<string, unknown>, sessionValue: Session | null, status = 200) {
+  const sid = sessionValue ? token(sessionValue) : "";
+  const res = NextResponse.json(sessionValue ? { ...data, token: sid, sid } : data, { status });
+  if (sid) {
+    const options = { sameSite: "lax" as const, secure: false, path: "/", maxAge: 60 * 60 * 24 * 30 };
+    res.cookies.set("unit3_session", sid, { ...options, httpOnly: true });
+    res.cookies.set("unit3_sid", sid, { ...options, httpOnly: false });
+  }
+  return res;
+}
+
+export function clearSessionResponse() {
+  const res = NextResponse.json({ ok: true, cleared: true });
+  res.cookies.set("unit3_session", "", { httpOnly: true, path: "/", maxAge: 0 });
+  res.cookies.set("unit3_sid", "", { httpOnly: false, path: "/", maxAge: 0 });
+  return res;
 }
