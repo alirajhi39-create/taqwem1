@@ -57,10 +57,14 @@ async function api(url: string, method = "GET", body?: unknown) {
     headers["X-Unit3-Session"] = accessToken;
     if (body && typeof body === "object" && !Array.isArray(body)) payload = { ...body, sessionToken: accessToken };
   }
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 15000);
   try {
-    response = await fetch(url, { method, headers, body: payload ? JSON.stringify(payload) : undefined, cache: "no-store", credentials: "include", signal: AbortSignal.timeout(15000) });
+    response = await fetch(url, { method, headers, body: payload ? JSON.stringify(payload) : undefined, cache: "no-store", credentials: "include", signal: controller.signal });
   } catch {
     throw new ApiError("تعذر الاتصال بالخادم. تحقق من الاتصال ثم حاول مرة أخرى.", 0);
+  } finally {
+    clearTimeout(timeout);
   }
   const data = await response.json().catch(() => ({ error: "استجابة غير متوقعة من الخادم. حاول مرة أخرى." }));
   if (!response.ok) throw new ApiError(data.error || "حدث خطأ، حاول مجددًا", response.status);
