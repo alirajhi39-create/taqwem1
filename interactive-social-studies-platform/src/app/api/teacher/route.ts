@@ -1,67 +1,50 @@
 import { db } from "@/db";
-import { ensureSchema } from "@/db/ensure";
-import { answers, attempts } from "@/db/schema";
-import { eq } from "drizzle-orm";
-import { decode, sessionFromRequest, teacherPasswordValid } from "@/lib/auth";
-import { readKey } from "@/lib/keys";
-import { resultsCsv, teacherDashboard } from "@/lib/records";
+import { answers, attempts, students } from "@/db/schema";
+import { eq, desc } from "drizzle-orm";
+import { session, sessionFromToken } from "@/lib/auth";
+import { questionTitles } from "@/lib/quiz";
+import { ACTIVE_CLASSROOM } from "@/lib/classrooms";
 
-export const dynamic = "force-dynamic";
-
-async function authorized(req: Request, body?: Record<string, unknown>) {
-  const raw = String(body?.k || new URL(req.url).searchParams.get("k") || "");
-  if (decode(raw)?.role === "teacher") return true;
-  const key = await readKey(raw).catch(() => null);
-  if (key?.role === "teacher") return true;
-  const session = sessionFromRequest(req, body);
-  return session?.role === "teacher" || teacherPasswordValid(String(body?.password || ""));
-}
-
-async function adjustScore(answerId: number, score: number) {
-  const [existing] = await db.select().from(answers).where(eq(answers.id, answerId)).limit(1);
-  if (!existing || existing.question < 4 || existing.question > 8) return null;
-  await db.update(answers).set({ score, correct: score === 10, needsReview: false, updatedAt: new Date() }).where(eq(answers.id, answerId));
-  const all = await db.select().from(answers).where(eq(answers.attemptId, existing.attemptId));
-  const total = all.reduce((sum, row) => sum + (row.id === answerId ? score : row.score), 0);
-  await db.update(attempts).set({ score: total }).where(eq(attempts.id, existing.attemptId));
-  return teacherDashboard();
+async function dashboard(format?: unknown) {
+  const records = await db.select({ attempt: attempts, student: students }).from(attempts).innerJoin(students, eq(attempts.studentId, students.id)).where(eq(students.classroom, ACTIVE_CLASSROOM)).orderBy(desc(attempts.id));
+  const responses = await db.select().from(answers);
+  const data = records.map(r => ({ ...r.attempt, student: r.student, answers: responses.filter(a => a.attemptId === r.attempt.id) }));
+  if (format === "csv") {
+    const esc = (s: unknown) => `"${String(s ?? "").replaceAll('"', '""')}"`;
+    const csv = "\uFEFF" + ["اسم الطالب,الفصل,التاريخ,الدرجة,النسبة,الحالة", ...data.map(a => [a.student.name, a.student.classroom, a.startedAt.toISOString(), a.score, `${Math.round(a.score / 90 * 100)}%`, a.status === "completed" ? "مكتمل" : "جارٍ"].map(esc).join(","))].join("\n");
+    return new Response(csv, { headers: { "Content-Type": "text/csv; charset=utf-8", "Content-Disposition": "attachment; filename=unit3-results.csv", "Cache-Control": "no-store" } });
+  }
+  const completed = data.filter(a => a.status === "completed");
+  const difficulty = questionTitles.map((title, i) => ({ title, average: completed.length ? Math.round(completed.reduce((sum, a) => sum + (a.answers.find(x => x.question === i + 1)?.score || 0), 0) / completed.length * 10) : 0 })).sort((a, b) => a.average - b.average);
+  return Response.json({ records: data, average: completed.length ? Math.round(completed.reduce((sum, a) => sum + a.score, 0) / completed.length / 90 * 100) : 0, difficulty }, { headers: { "Cache-Control": "no-store" } });
 }
 
 export async function GET(req: Request) {
-  await ensureSchema().catch(() => undefined);
-  const url = new URL(req.url);
-  const body = { password: url.searchParams.get("password") || "", sid: url.searchParams.get("sid") || "", k: url.searchParams.get("k") || "" };
-  if (!await authorized(req, body)) return Response.json({ error: "غير مصرح" }, { status: 401 });
-  const data = await teacherDashboard();
-  if (url.searchParams.get("format") === "csv") return new Response(resultsCsv(data), { headers: { "Content-Type": "text/csv; charset=utf-8", "Content-Disposition": "attachment; filename=unit3-results.csv" } });
-  return Response.json(data);
+  const user = await session(req);
+  if (user?.role !== "teacher") return Response.json({ error: "غير مصرح" }, { status: 401 });
+  return dashboard(new URL(req.url).searchParams.get("format"));
 }
 
 export async function POST(req: Request) {
-  await ensureSchema().catch(() => undefined);
-  const body = await req.json().catch(() => ({})) as Record<string, unknown>;
-  if (!await authorized(req, body)) return Response.json({ error: "غير مصرح" }, { status: 401 });
-  if (body.action === "csv") {
-    const csv = resultsCsv(await teacherDashboard());
-    return new Response(csv, { headers: { "Content-Type": "text/csv; charset=utf-8", "Content-Disposition": "attachment; filename=unit3-results.csv" } });
-  }
-  if (body.action === "score") {
-    const score = Number(body.score);
-    if (!Number.isInteger(score) || score < 0 || score > 10) return Response.json({ error: "درجة غير صالحة" }, { status: 400 });
-    const data = await adjustScore(Number(body.answerId), score);
-    if (!data) return Response.json({ error: "الإجابة ليست مقالاً" }, { status: 400 });
-    return Response.json(data);
-  }
-  return Response.json(await teacherDashboard());
+  const body = await req.json().catch(() => ({}));
+  const user = (typeof body.sessionToken === "string" ? await sessionFromToken(body.sessionToken) : null) || await session(req);
+  if (user?.role !== "teacher") return Response.json({ error: "غير مصرح" }, { status: 401 });
+  return dashboard(body.format);
 }
 
 export async function PATCH(req: Request) {
-  await ensureSchema().catch(() => undefined);
-  const body = await req.json().catch(() => ({})) as Record<string, unknown>;
-  if (!await authorized(req, body)) return Response.json({ error: "غير مصرح" }, { status: 401 });
-  const score = Number(body.score);
-  if (!Number.isInteger(score) || score < 0 || score > 10) return Response.json({ error: "درجة غير صالحة" }, { status: 400 });
-  const data = await adjustScore(Number(body.answerId), score);
-  if (!data) return Response.json({ error: "الإجابة ليست مقالاً" }, { status: 400 });
-  return Response.json({ ok: true, score: data.records.find((row) => row.answers.some((answer) => answer.id === Number(body.answerId)))?.score || 0, ...data });
+  const body = await req.json().catch(() => ({}));
+  const user = (typeof body.sessionToken === "string" ? await sessionFromToken(body.sessionToken) : null) || await session(req);
+  if (user?.role !== "teacher") return Response.json({ error: "غير مصرح" }, { status: 401 });
+  const id = Number(body.answerId), score = Number(body.score);
+  if (!Number.isInteger(id) || !Number.isInteger(score) || score < 0 || score > 10) return Response.json({ error: "درجة غير صالحة" }, { status: 400 });
+  const [existing] = await db.select().from(answers).where(eq(answers.id, id)).limit(1);
+  if (!existing || existing.question < 4 || existing.question > 8) return Response.json({ error: "الإجابة ليست مقالاً" }, { status: 400 });
+  const [owner] = await db.select({ classroom: students.classroom }).from(attempts).innerJoin(students, eq(attempts.studentId, students.id)).where(eq(attempts.id, existing.attemptId)).limit(1);
+  if (owner?.classroom !== ACTIVE_CLASSROOM) return Response.json({ error: "هذه الإجابة خارج الفصل المحدد" }, { status: 403 });
+  await db.update(answers).set({ score, correct: score === 10, needsReview: false, updatedAt: new Date() }).where(eq(answers.id, id));
+  const all = await db.select().from(answers).where(eq(answers.attemptId, existing.attemptId));
+  const total = all.reduce((sum, row) => sum + (row.id === id ? score : row.score), 0);
+  await db.update(attempts).set({ score: total }).where(eq(attempts.id, existing.attemptId));
+  return Response.json({ ok: true, score: total });
 }
